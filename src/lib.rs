@@ -9,7 +9,7 @@
 //!   data_step   — DATA … RUN/QUIT block (label = dataset name)
 //!   proc_step   — PROC … RUN/QUIT block (label = "PROCNAME" or "PROCNAME (DATA=ds)")
 
-use intentdiff_plugin_sdk::tree::{SemanticNode, SemanticNodeBuilder};
+use intentumdiff_plugin_sdk::tree::{SemanticNode, SemanticNodeBuilder};
 
 wit_bindgen::generate!({
     path: "wit/plugin.wit",
@@ -24,7 +24,7 @@ use crate::exports::intentdiff::plugin::parser::ParserMode;
 const PLUGIN_METADATA: &str = include_str!("../plugin_metadata.info");
 
 fn language_info_for(ids: Vec<String>) -> Vec<LanguageInfoRecord> {
-    let metadata = intentdiff_plugin_sdk::metadata::parse_plugin_metadata(PLUGIN_METADATA);
+    let metadata = intentumdiff_plugin_sdk::metadata::parse_plugin_metadata(PLUGIN_METADATA);
     ids.into_iter()
         .map(|language_id| {
             let info = metadata.language_or_default(&language_id);
@@ -274,7 +274,7 @@ export!(SasParser);
 mod tests {
     use super::*;
 
-    intentdiff_plugin_sdk::plugin_compliance_tests! {
+    intentumdiff_plugin_sdk::plugin_compliance_tests! {
         process: parse_sas,
         detect_fn: detect_language_impl,
         detect_cases: [
@@ -302,32 +302,32 @@ mod tests {
     #[test]
     fn test_valid_json_no_error() {
         let out = parse_sas(SAMPLE);
-        intentdiff_plugin_sdk::testing::assert_valid_json(&out, "SAMPLE");
-        intentdiff_plugin_sdk::testing::assert_no_error(&out, "SAMPLE");
+        intentumdiff_plugin_sdk::testing::assert_valid_json(&out, "SAMPLE");
+        intentumdiff_plugin_sdk::testing::assert_no_error(&out, "SAMPLE");
     }
 
     #[test]
     fn test_root_is_sas_program() {
         let out = parse_sas(SAMPLE);
-        intentdiff_plugin_sdk::testing::assert_root_node_type(&out, "sas_program", "SAMPLE");
+        intentumdiff_plugin_sdk::testing::assert_root_node_type(&out, "sas_program", "SAMPLE");
     }
 
     #[test]
     fn test_macro_found() {
         let out = parse_sas(SAMPLE);
-        intentdiff_plugin_sdk::testing::assert_contains_node_type(&out, "macro", "macro");
+        intentumdiff_plugin_sdk::testing::assert_contains_node_type(&out, "macro", "macro");
     }
 
     #[test]
     fn test_data_step_found() {
         let out = parse_sas(SAMPLE);
-        intentdiff_plugin_sdk::testing::assert_contains_node_type(&out, "data_step", "data_step");
+        intentumdiff_plugin_sdk::testing::assert_contains_node_type(&out, "data_step", "data_step");
     }
 
     #[test]
     fn test_proc_step_found() {
         let out = parse_sas(SAMPLE);
-        intentdiff_plugin_sdk::testing::assert_contains_node_type(&out, "proc_step", "proc_step");
+        intentumdiff_plugin_sdk::testing::assert_contains_node_type(&out, "proc_step", "proc_step");
     }
 
     #[test]
@@ -352,14 +352,14 @@ mod tests {
     fn test_simple_macro() {
         let src = "%MACRO greet;\n  %PUT Hello;\n%MEND greet;";
         let out = parse_sas(src);
-        intentdiff_plugin_sdk::testing::assert_contains_node_type(&out, "macro", "simple macro");
+        intentumdiff_plugin_sdk::testing::assert_contains_node_type(&out, "macro", "simple macro");
     }
 
     #[test]
     fn test_labels_nonempty() {
         let out = parse_sas(SAMPLE);
-        intentdiff_plugin_sdk::testing::assert_labels_nonempty(&out, "macro", "labels");
-        intentdiff_plugin_sdk::testing::assert_labels_nonempty(&out, "data_step", "labels");
-        intentdiff_plugin_sdk::testing::assert_labels_nonempty(&out, "proc_step", "labels");
+        intentumdiff_plugin_sdk::testing::assert_labels_nonempty(&out, "macro", "labels");
+        intentumdiff_plugin_sdk::testing::assert_labels_nonempty(&out, "data_step", "labels");
+        intentumdiff_plugin_sdk::testing::assert_labels_nonempty(&out, "proc_step", "labels");
     }
 }
