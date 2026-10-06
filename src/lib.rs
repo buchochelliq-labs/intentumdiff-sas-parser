@@ -76,7 +76,71 @@ struct Step {
     start_line: u32,
 }
 
+// Replace comments with spaces, preserving UTF-8 byte offsets and line breaks.
+// Quote tracking prevents comment-looking macro values from being discarded.
+fn without_comments(source: &str) -> Result<String, &'static str> {
+    let bytes = source.as_bytes();
+    let mut output = bytes.to_vec();
+    let mut i = 0;
+    let mut quote = None;
+    let mut statement_start = true;
+    while i < bytes.len() {
+        if let Some(q) = quote {
+            if bytes[i] == q {
+                if bytes.get(i + 1) == Some(&q) {
+                    i += 2;
+                    continue;
+                }
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        let block = bytes[i..].starts_with(b"/*");
+        let statement_comment =
+            bytes[i..].starts_with(b"%*") || (statement_start && bytes[i] == b'*');
+        if block || statement_comment {
+            let start = i;
+            i += if block || bytes[start] == b'%' { 2 } else { 1 };
+            while i < bytes.len()
+                && !(if block {
+                    bytes[i..].starts_with(b"*/")
+                } else {
+                    bytes[i] == b';'
+                })
+            {
+                i += 1;
+            }
+            if i == bytes.len() {
+                return Err("Unterminated SAS comment");
+            }
+            i += if block { 2 } else { 1 };
+            for byte in &mut output[start..i] {
+                if !matches!(*byte, b'\n' | b'\r') {
+                    *byte = b' ';
+                }
+            }
+            continue;
+        }
+        if matches!(bytes[i], b'\'' | b'"') {
+            quote = Some(bytes[i]);
+        }
+        if bytes[i] == b';' {
+            statement_start = true;
+        } else if !bytes[i].is_ascii_whitespace() {
+            statement_start = false;
+        }
+        i += 1;
+    }
+    String::from_utf8(output).map_err(|_| "Invalid SAS comment boundary")
+}
+
 pub(crate) fn parse_sas(source: &str) -> String {
+    let uncommented = match without_comments(source) {
+        Ok(text) => text,
+        Err(error) => return serde_json::json!({"error": error}).to_string(),
+    };
+    let source = uncommented.as_str();
     let mut children: Vec<SemanticNode> = Vec::new();
     let mut counter: usize = 0;
     let mut current: Option<Step> = None;
@@ -197,7 +261,30 @@ pub(crate) fn parse_sas(source: &str) -> String {
             let stmt = trimmed.trim_end_matches(';').trim();
             if !stmt.is_empty() {
                 let id = format!("{}.{}", step.id, step.statements.len());
-                step.statements.push(block_node(&id, "sas_statement", stmt, lineno, lineno));
+                step.statements
+                    .push(block_node(&id, "sas_statement", stmt, lineno, lineno));
+            }
+        } else {
+            // Global statements (notably %LET) affect later steps too. Dropping
+            // them makes value edits indistinguishable from unchanged source.
+            let stmt = trimmed.trim_end_matches(';').trim();
+            if !stmt.is_empty() {
+                let id = format!("0.{}", counter);
+                counter += 1;
+                let start_col = raw_line.len() - raw_line.trim_start().len();
+                children.push(
+                    SemanticNodeBuilder::new(
+                        &id,
+                        "sas_statement",
+                        stmt,
+                        lineno,
+                        start_col as u32,
+                        lineno,
+                        (start_col + trimmed.len()) as u32,
+                        String::new(),
+                    )
+                    .build(),
+                );
             }
         }
     }
@@ -285,6 +372,65 @@ mod tests {
         ],
         grammar_id: "sas",
         language_ids: ["sas"],
+    }
+
+    #[test]
+    fn top_level_macro_assignment_retains_value_and_source_span() {
+        let before = "\n  %let target = World;\ndata _null_;\n  put \"&target\";\nrun;\n";
+        let after = before.replace("World", "Other");
+        let old: serde_json::Value = serde_json::from_str(&parse_sas(before)).unwrap();
+        let new: serde_json::Value = serde_json::from_str(&parse_sas(&after)).unwrap();
+        assert_eq!(old["children"][0]["label"], "%let target = World");
+        assert_eq!(new["children"][0]["label"], "%let target = Other");
+        assert_eq!(
+            new["children"][0]["position"],
+            serde_json::json!({
+                "start_line": 1, "start_col": 2, "end_line": 1, "end_col": 22
+            })
+        );
+        assert_eq!(new["children"][1]["node_type"], "data_step");
+        assert_eq!(
+            new["children"][1]["children"][0]["label"],
+            "put \"&target\""
+        );
+    }
+
+    #[test]
+    fn top_level_statements_survive_between_steps_and_at_eof() {
+        let source =
+            "data first;\nrun;\n%let target = café;\nproc print data=first;\nrun;\n%put &target;\n";
+        let tree: serde_json::Value = serde_json::from_str(&parse_sas(source)).unwrap();
+        let nodes = tree["children"].as_array().unwrap();
+        assert_eq!(nodes.len(), 4);
+        assert_eq!(nodes[1]["label"], "%let target = café");
+        assert_eq!(nodes[3]["label"], "%put &target");
+        assert_eq!(nodes[1]["position"]["start_line"], 2);
+        assert_eq!(nodes[1]["position"]["end_col"], "%let target = café;".len());
+        let ids: std::collections::HashSet<_> =
+            nodes.iter().map(|n| n["id"].as_str().unwrap()).collect();
+        assert_eq!(ids.len(), nodes.len());
+        assert_eq!(parse_sas(source), parse_sas(source));
+    }
+
+    #[test]
+    fn global_comments_are_trivia_but_quoted_comment_markers_are_values() {
+        for (old, new) in [
+            ("/* old */\n%let x = 1;", "/* new */\n%let x = 1;"),
+            ("%* old;\n%let x = 1;", "%* new;\n%let x = 1;"),
+            (
+                "/* old\n comment */ %let x = 1;",
+                "/* new\n comment */ %let x = 1;",
+            ),
+            (
+                "%* old\n comment; %let x = 1;",
+                "%* new\n comment; %let x = 1;",
+            ),
+        ] {
+            assert_eq!(parse_sas(old), parse_sas(new));
+        }
+        let tree: serde_json::Value =
+            serde_json::from_str(&parse_sas("%let x = '/* value */';")).unwrap();
+        assert_eq!(tree["children"][0]["label"], "%let x = '/* value */'");
     }
 
     const SAMPLE: &str = "%MACRO calculate(dataset=);\n\
