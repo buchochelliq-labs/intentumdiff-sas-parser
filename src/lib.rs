@@ -197,7 +197,30 @@ pub(crate) fn parse_sas(source: &str) -> String {
             let stmt = trimmed.trim_end_matches(';').trim();
             if !stmt.is_empty() {
                 let id = format!("{}.{}", step.id, step.statements.len());
-                step.statements.push(block_node(&id, "sas_statement", stmt, lineno, lineno));
+                step.statements
+                    .push(block_node(&id, "sas_statement", stmt, lineno, lineno));
+            }
+        } else {
+            // Global statements (notably %LET) affect later steps too. Dropping
+            // them makes value edits indistinguishable from unchanged source.
+            let stmt = trimmed.trim_end_matches(';').trim();
+            if !stmt.is_empty() {
+                let id = format!("0.{}", counter);
+                counter += 1;
+                let start_col = raw_line.len() - raw_line.trim_start().len();
+                children.push(
+                    SemanticNodeBuilder::new(
+                        &id,
+                        "sas_statement",
+                        stmt,
+                        lineno,
+                        start_col as u32,
+                        lineno,
+                        (start_col + trimmed.len()) as u32,
+                        String::new(),
+                    )
+                    .build(),
+                );
             }
         }
     }
@@ -285,6 +308,44 @@ mod tests {
         ],
         grammar_id: "sas",
         language_ids: ["sas"],
+    }
+
+    #[test]
+    fn top_level_macro_assignment_retains_value_and_source_span() {
+        let before = "\n  %let target = World;\ndata _null_;\n  put \"&target\";\nrun;\n";
+        let after = before.replace("World", "Other");
+        let old: serde_json::Value = serde_json::from_str(&parse_sas(before)).unwrap();
+        let new: serde_json::Value = serde_json::from_str(&parse_sas(&after)).unwrap();
+        assert_eq!(old["children"][0]["label"], "%let target = World");
+        assert_eq!(new["children"][0]["label"], "%let target = Other");
+        assert_eq!(
+            new["children"][0]["position"],
+            serde_json::json!({
+                "start_line": 1, "start_col": 2, "end_line": 1, "end_col": 22
+            })
+        );
+        assert_eq!(new["children"][1]["node_type"], "data_step");
+        assert_eq!(
+            new["children"][1]["children"][0]["label"],
+            "put \"&target\""
+        );
+    }
+
+    #[test]
+    fn top_level_statements_survive_between_steps_and_at_eof() {
+        let source =
+            "data first;\nrun;\n%let target = café;\nproc print data=first;\nrun;\n%put &target;\n";
+        let tree: serde_json::Value = serde_json::from_str(&parse_sas(source)).unwrap();
+        let nodes = tree["children"].as_array().unwrap();
+        assert_eq!(nodes.len(), 4);
+        assert_eq!(nodes[1]["label"], "%let target = café");
+        assert_eq!(nodes[3]["label"], "%put &target");
+        assert_eq!(nodes[1]["position"]["start_line"], 2);
+        assert_eq!(nodes[1]["position"]["end_col"], "%let target = café;".len());
+        let ids: std::collections::HashSet<_> =
+            nodes.iter().map(|n| n["id"].as_str().unwrap()).collect();
+        assert_eq!(ids.len(), nodes.len());
+        assert_eq!(parse_sas(source), parse_sas(source));
     }
 
     const SAMPLE: &str = "%MACRO calculate(dataset=);\n\
