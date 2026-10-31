@@ -52,6 +52,23 @@ fn block_node(id: &str, node_type: &str, label: &str, start: u32, end: u32) -> S
     SemanticNodeBuilder::new(id, node_type, label, start, 0, end, 0, String::new()).build()
 }
 
+// Statement labels omit their terminating semicolon, but spans must still
+// identify the original UTF-8 source bytes that produced the semantic leaf.
+fn statement_node(id: &str, statement: &str, raw_line: &str, line: u32) -> SemanticNode {
+    let start_col = raw_line.len() - raw_line.trim_start().len();
+    SemanticNodeBuilder::new(
+        id,
+        "sas_statement",
+        statement,
+        line,
+        start_col as u32,
+        line,
+        (start_col + statement.len()) as u32,
+        String::new(),
+    )
+    .build()
+}
+
 // ---------------------------------------------------------------------------
 // Language detection
 // ---------------------------------------------------------------------------
@@ -262,7 +279,7 @@ pub(crate) fn parse_sas(source: &str) -> String {
             if !stmt.is_empty() {
                 let id = format!("{}.{}", step.id, step.statements.len());
                 step.statements
-                    .push(block_node(&id, "sas_statement", stmt, lineno, lineno));
+                    .push(statement_node(&id, stmt, raw_line, lineno));
             }
         } else {
             // Global statements (notably %LET) affect later steps too. Dropping
@@ -271,20 +288,7 @@ pub(crate) fn parse_sas(source: &str) -> String {
             if !stmt.is_empty() {
                 let id = format!("0.{}", counter);
                 counter += 1;
-                let start_col = raw_line.len() - raw_line.trim_start().len();
-                children.push(
-                    SemanticNodeBuilder::new(
-                        &id,
-                        "sas_statement",
-                        stmt,
-                        lineno,
-                        start_col as u32,
-                        lineno,
-                        (start_col + trimmed.len()) as u32,
-                        String::new(),
-                    )
-                    .build(),
-                );
+                children.push(statement_node(&id, stmt, raw_line, lineno));
             }
         }
     }
@@ -372,6 +376,41 @@ mod tests {
         ],
         grammar_id: "sas",
         language_ids: ["sas"],
+    }
+
+    #[test]
+    fn interior_statement_spans_cover_changed_bytes_in_utf8_source() {
+        for (before, after, start_col) in [
+            (
+                "data work.metrics;\n  attempts = 4;\nrun;\n",
+                "data work.metrics;\n  attempts = 5;\nrun;\n",
+                2,
+            ),
+            (
+                "proc print;\n    note = 'café' || 4;\nrun;\n",
+                "proc print;\n    note = 'café' || 5;\nrun;\n",
+                4,
+            ),
+        ] {
+            let old: serde_json::Value = serde_json::from_str(&parse_sas(before)).unwrap();
+            let new: serde_json::Value = serde_json::from_str(&parse_sas(after)).unwrap();
+            let old_leaf = &old["children"][0]["children"][0];
+            let new_leaf = &new["children"][0]["children"][0];
+            assert_ne!(old_leaf["label"], new_leaf["label"]);
+            let old_col = before.lines().nth(1).unwrap().find('4').unwrap() as u32;
+            let new_col = after.lines().nth(1).unwrap().find('5').unwrap() as u32;
+            for (leaf, col) in [(old_leaf, old_col), (new_leaf, new_col)] {
+                assert_eq!(leaf["node_type"], "sas_statement");
+                assert_eq!(leaf["position"]["start_line"], 1);
+                assert_eq!(leaf["position"]["end_line"], 1);
+                assert_eq!(leaf["position"]["start_col"], start_col);
+                assert!(
+                    leaf["position"]["start_col"].as_u64().unwrap() <= col as u64
+                        && leaf["position"]["end_col"].as_u64().unwrap() > col as u64,
+                    "the changed byte at column {col} must fall inside {leaf:?}"
+                );
+            }
+        }
     }
 
     #[test]
