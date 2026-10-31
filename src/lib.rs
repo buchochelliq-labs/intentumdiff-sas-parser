@@ -52,8 +52,8 @@ fn block_node(id: &str, node_type: &str, label: &str, start: u32, end: u32) -> S
     SemanticNodeBuilder::new(id, node_type, label, start, 0, end, 0, String::new()).build()
 }
 
-// Statement labels omit their terminating semicolon, but spans must still
-// identify the original UTF-8 source bytes that produced the semantic leaf.
+// Statement labels omit their terminating semicolon, while source spans
+// cover the original statement including its terminator and UTF-8 bytes.
 fn statement_node(id: &str, statement: &str, raw_line: &str, line: u32) -> SemanticNode {
     let start_col = raw_line.len() - raw_line.trim_start().len();
     SemanticNodeBuilder::new(
@@ -63,7 +63,7 @@ fn statement_node(id: &str, statement: &str, raw_line: &str, line: u32) -> Seman
         line,
         start_col as u32,
         line,
-        (start_col + statement.len()) as u32,
+        (start_col + raw_line.trim().len()) as u32,
         String::new(),
     )
     .build()
