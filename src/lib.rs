@@ -74,6 +74,8 @@ struct Step {
     node_type: &'static str,
     label: String,
     start_line: u32,
+    start_col: u32,
+    opening_end_col: u32,
 }
 
 // Replace comments with spaces, preserving UTF-8 byte offsets and line breaks.
@@ -156,6 +158,13 @@ pub(crate) fn parse_sas(source: &str) -> String {
                     step.start_line,
                     end_line,
                 );
+                // Rust source spans must describe original, nonempty source bytes.
+                // An inline PROC/RUN step can open and end on the same row:
+                // the former (row, 0)-(row, 0) claimed no source at all.
+                block.position.start_col = step.start_col;
+                if step.start_line == end_line {
+                    block.position.end_col = step.opening_end_col;
+                }
                 block.children = step.statements;
                 children.push(block);
             }
@@ -168,6 +177,8 @@ pub(crate) fn parse_sas(source: &str) -> String {
             continue;
         }
 
+        let source_col = (raw_line.len() - raw_line.trim_start().len()) as u32;
+        let source_end_col = raw_line.trim_end().len() as u32;
         let upper = trimmed.to_uppercase();
         let words: Vec<&str> = upper.split_whitespace().collect();
         if words.is_empty() {
@@ -193,6 +204,8 @@ pub(crate) fn parse_sas(source: &str) -> String {
                 node_type: "macro",
                 label: name,
                 start_line: lineno,
+                start_col: source_col,
+                opening_end_col: source_end_col,
             });
             continue;
         }
@@ -219,6 +232,8 @@ pub(crate) fn parse_sas(source: &str) -> String {
                 node_type: "data_step",
                 label: name,
                 start_line: lineno,
+                start_col: source_col,
+                opening_end_col: source_end_col,
             });
             continue;
         }
@@ -245,6 +260,8 @@ pub(crate) fn parse_sas(source: &str) -> String {
                 node_type: "proc_step",
                 label,
                 start_line: lineno,
+                start_col: source_col,
+                opening_end_col: source_end_col,
             });
             continue;
         }
@@ -261,8 +278,22 @@ pub(crate) fn parse_sas(source: &str) -> String {
             let stmt = trimmed.trim_end_matches(';').trim();
             if !stmt.is_empty() {
                 let id = format!("{}.{}", step.id, step.statements.len());
-                step.statements
-                    .push(block_node(&id, "sas_statement", stmt, lineno, lineno));
+                // Preserve the UTF-8 byte columns of the original statement.
+                // A same-line (line, 0)-(line, 0) span is empty and prevents
+                // downstream source-judged change verification.
+                step.statements.push(
+                    SemanticNodeBuilder::new(
+                        &id,
+                        "sas_statement",
+                        stmt,
+                        lineno,
+                        source_col,
+                        lineno,
+                        source_end_col,
+                        String::new(),
+                    )
+                    .build(),
+                );
             }
         } else {
             // Global statements (notably %LET) affect later steps too. Dropping
@@ -508,4 +539,48 @@ mod tests {
         intentumdiff_plugin_sdk::testing::assert_labels_nonempty(&out, "data_step", "labels");
         intentumdiff_plugin_sdk::testing::assert_labels_nonempty(&out, "proc_step", "labels");
     }
+
+    #[test]
+    fn interior_statements_anchor_labels_to_original_utf8_bytes() {
+        let source = "data work.greeting;\n  message = cats(\"Olá\", name);\n  attempts = 4;\nrun;\n\ndata work.audit;\n  checked = 9;\nrun;\n";
+        let tree: serde_json::Value = serde_json::from_str(&parse_sas(source)).unwrap();
+        let steps = tree["children"].as_array().unwrap();
+        for (step, child, line, label) in [
+            (0, 0, 1, "message = cats(\"Olá\", name)"),
+            (0, 1, 2, "attempts = 4"),
+            (1, 0, 6, "checked = 9"),
+        ] {
+            let node = &steps[step]["children"][child];
+            assert_eq!(node["label"], label);
+            let span = &node["position"];
+            assert_eq!(span["start_line"].as_u64(), Some(line));
+            assert_eq!(span["end_line"].as_u64(), Some(line));
+            let raw = source.lines().nth(line as usize).unwrap();
+            let start = span["start_col"].as_u64().unwrap() as usize;
+            let end = span["end_col"].as_u64().unwrap() as usize;
+            assert!(start < end && end <= raw.len(), "{node:?}");
+            assert_eq!(raw[start..end].trim_end_matches(';'), label);
+            assert_eq!(start, 2);
+            assert_eq!(end, raw.len());
+        }
+    }
+
+    #[test]
+    fn inline_proc_has_nonempty_original_utf8_source_extent() {
+        // The same-line PROC/RUN fixture previously had (18,0)-(18,0).
+        let source = "  proc print data=work.greeting; run;\n";
+        let tree: serde_json::Value = serde_json::from_str(&parse_sas(source)).unwrap();
+        let nodes = tree["children"].as_array().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0]["node_type"], "proc_step");
+        assert_eq!(nodes[0]["label"], "PRINT (DATA=WORK.GREETING)");
+        assert_eq!(nodes[0]["position"]["start_line"].as_u64(), Some(0));
+        assert_eq!(nodes[0]["position"]["start_col"].as_u64(), Some(2));
+        assert_eq!(nodes[0]["position"]["end_line"].as_u64(), Some(0));
+        assert_eq!(
+            nodes[0]["position"]["end_col"].as_u64(),
+            Some(source.trim_end().len() as u64)
+        );
+    }
+
 }
