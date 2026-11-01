@@ -278,8 +278,22 @@ pub(crate) fn parse_sas(source: &str) -> String {
             let stmt = trimmed.trim_end_matches(';').trim();
             if !stmt.is_empty() {
                 let id = format!("{}.{}", step.id, step.statements.len());
-                step.statements
-                    .push(block_node(&id, "sas_statement", stmt, lineno, lineno));
+                // Preserve the UTF-8 byte columns of the original statement.
+                // A same-line (line, 0)-(line, 0) span is empty and prevents
+                // downstream source-judged change verification.
+                step.statements.push(
+                    SemanticNodeBuilder::new(
+                        &id,
+                        "sas_statement",
+                        stmt,
+                        lineno,
+                        source_col,
+                        lineno,
+                        source_end_col,
+                        String::new(),
+                    )
+                    .build(),
+                );
             }
         } else {
             // Global statements (notably %LET) affect later steps too. Dropping
@@ -524,6 +538,31 @@ mod tests {
         intentumdiff_plugin_sdk::testing::assert_labels_nonempty(&out, "macro", "labels");
         intentumdiff_plugin_sdk::testing::assert_labels_nonempty(&out, "data_step", "labels");
         intentumdiff_plugin_sdk::testing::assert_labels_nonempty(&out, "proc_step", "labels");
+    }
+
+    #[test]
+    fn interior_statements_anchor_labels_to_original_utf8_bytes() {
+        let source = "data work.greeting;\n  message = cats(\"Olá\", name);\n  attempts = 4;\nrun;\n\ndata work.audit;\n  checked = 9;\nrun;\n";
+        let tree: serde_json::Value = serde_json::from_str(&parse_sas(source)).unwrap();
+        let steps = tree["children"].as_array().unwrap();
+        for (step, child, line, label) in [
+            (0, 0, 1, "message = cats(\"Olá\", name)"),
+            (0, 1, 2, "attempts = 4"),
+            (1, 0, 6, "checked = 9"),
+        ] {
+            let node = &steps[step]["children"][child];
+            assert_eq!(node["label"], label);
+            let span = &node["position"];
+            assert_eq!(span["start_line"].as_u64(), Some(line));
+            assert_eq!(span["end_line"].as_u64(), Some(line));
+            let raw = source.lines().nth(line as usize).unwrap();
+            let start = span["start_col"].as_u64().unwrap() as usize;
+            let end = span["end_col"].as_u64().unwrap() as usize;
+            assert!(start < end && end <= raw.len(), "{node:?}");
+            assert_eq!(raw[start..end].trim_end_matches(';'), label);
+            assert_eq!(start, 2);
+            assert_eq!(end, raw.len());
+        }
     }
 
     #[test]
