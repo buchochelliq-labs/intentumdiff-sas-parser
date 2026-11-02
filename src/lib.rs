@@ -406,6 +406,41 @@ mod tests {
     }
 
     #[test]
+    fn interior_statement_spans_cover_changed_bytes_in_utf8_source() {
+        for (before, after, start_col) in [
+            (
+                "data work.metrics;\n  attempts = 4;\nrun;\n",
+                "data work.metrics;\n  attempts = 5;\nrun;\n",
+                2,
+            ),
+            (
+                "proc print;\n    note = 'café' || 4;\nrun;\n",
+                "proc print;\n    note = 'café' || 5;\nrun;\n",
+                4,
+            ),
+        ] {
+            let old: serde_json::Value = serde_json::from_str(&parse_sas(before)).unwrap();
+            let new: serde_json::Value = serde_json::from_str(&parse_sas(after)).unwrap();
+            let old_leaf = &old["children"][0]["children"][0];
+            let new_leaf = &new["children"][0]["children"][0];
+            assert_ne!(old_leaf["label"], new_leaf["label"]);
+            let old_col = before.lines().nth(1).unwrap().find('4').unwrap() as u32;
+            let new_col = after.lines().nth(1).unwrap().find('5').unwrap() as u32;
+            for (leaf, col) in [(old_leaf, old_col), (new_leaf, new_col)] {
+                assert_eq!(leaf["node_type"], "sas_statement");
+                assert_eq!(leaf["position"]["start_line"], 1);
+                assert_eq!(leaf["position"]["end_line"], 1);
+                assert_eq!(leaf["position"]["start_col"], start_col);
+                assert!(
+                    leaf["position"]["start_col"].as_u64().unwrap() <= col as u64
+                        && leaf["position"]["end_col"].as_u64().unwrap() > col as u64,
+                    "the changed byte at column {col} must fall inside {leaf:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn top_level_macro_assignment_retains_value_and_source_span() {
         let before = "\n  %let target = World;\ndata _null_;\n  put \"&target\";\nrun;\n";
         let after = before.replace("World", "Other");
