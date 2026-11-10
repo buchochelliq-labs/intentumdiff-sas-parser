@@ -45,14 +45,6 @@ fn language_info_for(ids: Vec<String>) -> Vec<LanguageInfoRecord> {
 struct SasParser;
 
 // ---------------------------------------------------------------------------
-// Node helpers
-// ---------------------------------------------------------------------------
-
-fn block_node(id: &str, node_type: &str, label: &str, start: u32, end: u32) -> SemanticNode {
-    SemanticNodeBuilder::new(id, node_type, label, start, 0, end, 0, String::new()).build()
-}
-
-// ---------------------------------------------------------------------------
 // Language detection
 // ---------------------------------------------------------------------------
 
@@ -67,16 +59,6 @@ pub(crate) fn detect_language_impl(filename: &str, _content: &str) -> String {
 // ---------------------------------------------------------------------------
 // Parser
 // ---------------------------------------------------------------------------
-
-struct Step {
-    statements: Vec<SemanticNode>,
-    id: String,
-    node_type: &'static str,
-    label: String,
-    start_line: u32,
-    start_col: u32,
-    opening_end_col: u32,
-}
 
 // Replace comments with spaces, preserving UTF-8 byte offsets and line breaks.
 // Quote tracking prevents comment-looking macro values from being discarded.
@@ -137,204 +119,301 @@ fn without_comments(source: &str) -> Result<String, &'static str> {
     String::from_utf8(output).map_err(|_| "Invalid SAS comment boundary")
 }
 
+/// One semicolon-terminated SAS statement, located in the original source.
+struct Statement {
+    /// Statement text without its terminating `;`, whitespace runs outside
+    /// quoted strings collapsed to one space (layout is not semantics).
+    text: String,
+    start: (u32, u32),
+    end: (u32, u32),
+}
+
+/// Byte offset -> (0-based row, UTF-8 byte column).
+struct LineIndex {
+    starts: Vec<usize>,
+}
+
+impl LineIndex {
+    fn new(source: &str) -> Self {
+        let mut starts = vec![0];
+        starts.extend(
+            source
+                .bytes()
+                .enumerate()
+                .filter(|(_, b)| *b == b'\n')
+                .map(|(i, _)| i + 1),
+        );
+        LineIndex { starts }
+    }
+
+    fn at(&self, offset: usize) -> (u32, u32) {
+        let row = self.starts.partition_point(|&s| s <= offset) - 1;
+        (row as u32, (offset - self.starts[row]) as u32)
+    }
+}
+
+fn starts_with_ignore_case(bytes: &[u8], prefix: &[u8]) -> bool {
+    bytes.len() >= prefix.len() && bytes[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+/// Collapse whitespace outside quoted strings; quoted content is kept verbatim.
+fn normalize_statement(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut quote: Option<char> = None;
+    let mut pending_space = false;
+    for ch in text.chars() {
+        if let Some(q) = quote {
+            out.push(ch);
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        if ch.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        if ch == '\'' || ch == '"' {
+            quote = Some(ch);
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Split comment-free SAS source into statements. A `;` ends a statement
+/// unless it is inside a quoted string or a `%str(...)` / `%nrstr(...)`
+/// macro quoting function. Several statements may share one line and one
+/// statement may span several lines; text after the last `;` is kept as a
+/// final unterminated statement so no source is silently dropped.
+fn split_statements(source: &str) -> Vec<Statement> {
+    let bytes = source.as_bytes();
+    let index = LineIndex::new(source);
+    let mut statements = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let start = i;
+        let mut quote: Option<u8> = None;
+        let mut macro_paren_depth = 0usize;
+        let mut terminator = None;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if let Some(q) = quote {
+                if b == q {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            match b {
+                b'\'' | b'"' => quote = Some(b),
+                b'%' if macro_paren_depth == 0
+                    && (starts_with_ignore_case(&bytes[i..], b"%str(")
+                        || starts_with_ignore_case(&bytes[i..], b"%nrstr(")) =>
+                {
+                    let open = i + bytes[i..].iter().position(|&c| c == b'(').unwrap_or(0);
+                    macro_paren_depth = 1;
+                    i = open + 1;
+                    continue;
+                }
+                b'(' if macro_paren_depth > 0 => macro_paren_depth += 1,
+                b')' if macro_paren_depth > 0 => macro_paren_depth -= 1,
+                b';' if macro_paren_depth == 0 => {
+                    terminator = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let (body_end, end) = match terminator {
+            Some(semi) => (semi, semi + 1),
+            None => {
+                let trimmed = source[start..].trim_end().len();
+                (start + trimmed, start + trimmed)
+            }
+        };
+        i = end;
+        let text = normalize_statement(&source[start..body_end]);
+        statements.push(Statement {
+            text,
+            start: index.at(start),
+            end: index.at(end),
+        });
+    }
+    statements
+}
+
+/// An open container (root, %MACRO, DATA step or PROC step) being filled.
+struct Frame {
+    id: String,
+    node_type: &'static str,
+    label: String,
+    start: (u32, u32),
+    end: (u32, u32),
+    children: Vec<SemanticNode>,
+}
+
+impl Frame {
+    fn next_id(&self) -> String {
+        format!("{}.{}", self.id, self.children.len())
+    }
+
+    fn is_step(&self) -> bool {
+        matches!(self.node_type, "data_step" | "proc_step")
+    }
+
+    fn push_statement(&mut self, stmt: &Statement) {
+        let id = self.next_id();
+        self.children.push(
+            SemanticNodeBuilder::new(
+                &id,
+                "sas_statement",
+                &stmt.text,
+                stmt.start.0,
+                stmt.start.1,
+                stmt.end.0,
+                stmt.end.1,
+                String::new(),
+            )
+            .build(),
+        );
+        self.end = stmt.end;
+    }
+
+    fn into_node(self) -> SemanticNode {
+        SemanticNodeBuilder::new(
+            &self.id,
+            self.node_type,
+            &self.label,
+            self.start.0,
+            self.start.1,
+            self.end.0,
+            self.end.1,
+            String::new(),
+        )
+        .children(self.children)
+        .build()
+    }
+}
+
+/// Pop the innermost frame into its parent. The root frame is never popped.
+fn close_top(stack: &mut Vec<Frame>) {
+    if stack.len() > 1 {
+        let frame = stack.pop().expect("stack has a non-root frame");
+        let parent = stack.last_mut().expect("root frame remains");
+        parent.end = frame.end;
+        parent.children.push(frame.into_node());
+    }
+}
+
+/// Open a block whose opening statement is kept verbatim as its first child,
+/// so header-only edits (macro parameter defaults, PROC/DATA options) are
+/// visible as content changes rather than vanishing into the block label.
+fn open_block(stack: &mut Vec<Frame>, node_type: &'static str, label: String, header: &Statement) {
+    let id = stack.last().expect("root frame").next_id();
+    let mut frame = Frame {
+        id,
+        node_type,
+        label,
+        start: header.start,
+        end: header.end,
+        children: Vec::new(),
+    };
+    frame.push_statement(header);
+    stack.push(frame);
+}
+
 pub(crate) fn parse_sas(source: &str) -> String {
     let uncommented = match without_comments(source) {
         Ok(text) => text,
         Err(error) => return serde_json::json!({"error": error}).to_string(),
     };
-    let source = uncommented.as_str();
-    let mut children: Vec<SemanticNode> = Vec::new();
-    let mut counter: usize = 0;
-    let mut current: Option<Step> = None;
     let total_lines = source.lines().count().saturating_sub(1) as u32;
+    let mut stack = vec![Frame {
+        id: "0".to_string(),
+        node_type: "sas_program",
+        label: "sas_program".to_string(),
+        start: (0, 0),
+        end: (0, 0),
+        children: Vec::new(),
+    }];
 
-    let close_current =
-        |current: &mut Option<Step>, children: &mut Vec<SemanticNode>, end_line: u32| {
-            if let Some(step) = current.take() {
-                let mut block = block_node(
-                    &step.id,
-                    step.node_type,
-                    &step.label,
-                    step.start_line,
-                    end_line,
-                );
-                // Rust source spans must describe original, nonempty source bytes.
-                // An inline PROC/RUN step can open and end on the same row:
-                // the former (row, 0)-(row, 0) claimed no source at all.
-                block.position.start_col = step.start_col;
-                if step.start_line == end_line {
-                    block.position.end_col = step.opening_end_col;
-                }
-                block.children = step.statements;
-                children.push(block);
-            }
-        };
-
-    for (idx, raw_line) in source.lines().enumerate() {
-        let lineno = idx as u32;
-        let trimmed = raw_line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('*') {
-            continue;
-        }
-
-        let source_col = (raw_line.len() - raw_line.trim_start().len()) as u32;
-        let source_end_col = raw_line.trim_end().len() as u32;
-        let upper = trimmed.to_uppercase();
+    for stmt in split_statements(&uncommented) {
+        let upper = stmt.text.to_uppercase();
         let words: Vec<&str> = upper.split_whitespace().collect();
-        if words.is_empty() {
+        let Some(&first) = words.first() else {
             continue;
-        }
-
-        // %MACRO opens a macro block
-        if words[0] == "%MACRO" {
-            close_current(&mut current, &mut children, lineno.saturating_sub(1));
-            let name = words
-                .get(1)
-                .copied()
-                .unwrap_or("(anonymous)")
-                .split('(')
-                .next()
-                .unwrap_or("(anonymous)")
-                .to_string();
-            let id = format!("0.{}", counter);
-            counter += 1;
-            current = Some(Step {
-                statements: Vec::new(),
-                id,
-                node_type: "macro",
-                label: name,
-                start_line: lineno,
-                start_col: source_col,
-                opening_end_col: source_end_col,
-            });
-            continue;
-        }
-
-        // %MEND closes a macro block
-        if words[0] == "%MEND" {
-            close_current(&mut current, &mut children, lineno);
-            continue;
-        }
-
-        // DATA opens a data step
-        if words[0] == "DATA" && current.is_none() {
-            let name = words
-                .get(1)
-                .copied()
-                .unwrap_or("(anonymous)")
-                .trim_end_matches(';')
-                .to_string();
-            let id = format!("0.{}", counter);
-            counter += 1;
-            current = Some(Step {
-                statements: Vec::new(),
-                id,
-                node_type: "data_step",
-                label: name,
-                start_line: lineno,
-                start_col: source_col,
-                opening_end_col: source_end_col,
-            });
-            continue;
-        }
-
-        // PROC opens a proc step
-        if words[0] == "PROC" && current.is_none() && words.len() >= 2 {
-            let proc_name = words[1].to_string();
-            // Look for DATA=<name>
-            let data_arg = upper
-                .split_whitespace()
-                .find(|w| w.starts_with("DATA="))
-                .map(|w| w.trim_end_matches(';').to_string());
-            let label = if let Some(d) = data_arg {
-                let ds = d.trim_start_matches("DATA=");
-                format!("{} (DATA={})", proc_name, ds)
-            } else {
-                proc_name
-            };
-            let id = format!("0.{}", counter);
-            counter += 1;
-            current = Some(Step {
-                statements: Vec::new(),
-                id,
-                node_type: "proc_step",
-                label,
-                start_line: lineno,
-                start_col: source_col,
-                opening_end_col: source_end_col,
-            });
-            continue;
-        }
-
-        // RUN; or QUIT; closes the current step
-        if words[0] == "RUN;" || words[0] == "RUN" || words[0] == "QUIT;" || words[0] == "QUIT" {
-            close_current(&mut current, &mut children, lineno);
-            continue;
-        }
-
-        // #46: interior statement lines are review content — carry them as children so a
-        // value edit inside a step (`attempts = 4;` -> `5`) surfaces instead of vanishing.
-        if let Some(step) = current.as_mut() {
-            let stmt = trimmed.trim_end_matches(';').trim();
-            if !stmt.is_empty() {
-                let id = format!("{}.{}", step.id, step.statements.len());
-                // Preserve the UTF-8 byte columns of the original statement.
-                // A same-line (line, 0)-(line, 0) span is empty and prevents
-                // downstream source-judged change verification.
-                step.statements.push(
-                    SemanticNodeBuilder::new(
-                        &id,
-                        "sas_statement",
-                        stmt,
-                        lineno,
-                        source_col,
-                        lineno,
-                        source_end_col,
-                        String::new(),
-                    )
-                    .build(),
-                );
+        };
+        match first {
+            "%MACRO" => {
+                let name = words
+                    .get(1)
+                    .and_then(|w| w.split('(').next())
+                    .filter(|w| !w.is_empty())
+                    .unwrap_or("(anonymous)")
+                    .to_string();
+                open_block(&mut stack, "macro", name, &stmt);
             }
-        } else {
-            // Global statements (notably %LET) affect later steps too. Dropping
-            // them makes value edits indistinguishable from unchanged source.
-            let stmt = trimmed.trim_end_matches(';').trim();
-            if !stmt.is_empty() {
-                let id = format!("0.{}", counter);
-                counter += 1;
-                let start_col = raw_line.len() - raw_line.trim_start().len();
-                children.push(
-                    SemanticNodeBuilder::new(
-                        &id,
-                        "sas_statement",
-                        stmt,
-                        lineno,
-                        start_col as u32,
-                        lineno,
-                        (start_col + trimmed.len()) as u32,
-                        String::new(),
-                    )
-                    .build(),
-                );
+            "%MEND" if stack.iter().any(|f| f.node_type == "macro") => {
+                while let Some(top) = stack.last_mut() {
+                    let is_macro = top.node_type == "macro";
+                    top.end = stmt.end;
+                    close_top(&mut stack);
+                    if is_macro {
+                        break;
+                    }
+                }
             }
+            "DATA" | "PROC" if first == "DATA" || words.len() >= 2 => {
+                // A DATA or PROC statement implicitly ends the previous step.
+                if stack.last().is_some_and(Frame::is_step) {
+                    close_top(&mut stack);
+                }
+                let (node_type, label) = if first == "DATA" {
+                    let name = words.get(1).copied().unwrap_or("(anonymous)");
+                    ("data_step", name.to_string())
+                } else {
+                    let proc_name = words[1];
+                    let label = match words.iter().find(|w| w.starts_with("DATA=")) {
+                        Some(arg) => format!("{} (DATA={})", proc_name, &arg["DATA=".len()..]),
+                        None => proc_name.to_string(),
+                    };
+                    ("proc_step", label)
+                };
+                open_block(&mut stack, node_type, label, &stmt);
+            }
+            "RUN" | "QUIT" if stack.last().is_some_and(Frame::is_step) => {
+                let top = stack.last_mut().expect("step frame");
+                if words.len() > 1 {
+                    // `RUN CANCEL;` and friends change behaviour: keep them.
+                    top.push_statement(&stmt);
+                }
+                top.end = stmt.end;
+                close_top(&mut stack);
+            }
+            _ => stack.last_mut().expect("root frame").push_statement(&stmt),
         }
     }
 
-    // Drain unclosed step
-    close_current(&mut current, &mut children, total_lines);
-
-    let root = SemanticNodeBuilder::new(
-        "0",
-        "sas_program",
-        "sas_program",
-        0,
-        0,
-        total_lines,
-        0,
-        String::new(),
-    )
-    .children(children)
-    .build();
+    // Drain unclosed blocks.
+    while stack.len() > 1 {
+        close_top(&mut stack);
+    }
+    let mut root = stack.pop().expect("root frame");
+    root.start = (0, 0);
+    root.end = (total_lines, 0);
+    let root = root.into_node();
 
     match serde_json::to_string(&root) {
         Ok(s) => s,
@@ -421,8 +500,9 @@ mod tests {
         ] {
             let old: serde_json::Value = serde_json::from_str(&parse_sas(before)).unwrap();
             let new: serde_json::Value = serde_json::from_str(&parse_sas(after)).unwrap();
-            let old_leaf = &old["children"][0]["children"][0];
-            let new_leaf = &new["children"][0]["children"][0];
+            // Child 0 is the step's opening statement; the edit is child 1.
+            let old_leaf = &old["children"][0]["children"][1];
+            let new_leaf = &new["children"][0]["children"][1];
             assert_ne!(old_leaf["label"], new_leaf["label"]);
             let old_col = before.lines().nth(1).unwrap().find('4').unwrap() as u32;
             let new_col = after.lines().nth(1).unwrap().find('5').unwrap() as u32;
@@ -456,7 +536,7 @@ mod tests {
         );
         assert_eq!(new["children"][1]["node_type"], "data_step");
         assert_eq!(
-            new["children"][1]["children"][0]["label"],
+            new["children"][1]["children"][1]["label"],
             "put \"&target\""
         );
     }
@@ -581,9 +661,9 @@ mod tests {
         let tree: serde_json::Value = serde_json::from_str(&parse_sas(source)).unwrap();
         let steps = tree["children"].as_array().unwrap();
         for (step, child, line, label) in [
-            (0, 0, 1, "message = cats(\"Olá\", name)"),
-            (0, 1, 2, "attempts = 4"),
-            (1, 0, 6, "checked = 9"),
+            (0, 1, 1, "message = cats(\"Olá\", name)"),
+            (0, 2, 2, "attempts = 4"),
+            (1, 1, 6, "checked = 9"),
         ] {
             let node = &steps[step]["children"][child];
             assert_eq!(node["label"], label);
@@ -618,4 +698,230 @@ mod tests {
         );
     }
 
+    // -- #9: macro defaults, PROC options and inline statements ---------------
+
+    fn tree(source: &str) -> serde_json::Value {
+        let out = parse_sas(source);
+        intentumdiff_plugin_sdk::testing::assert_no_error(&out, source);
+        serde_json::from_str(&out).unwrap()
+    }
+
+    /// Every node as (node_type, label, [start_line, start_col, end_line, end_col]).
+    fn flatten(node: &serde_json::Value, out: &mut Vec<(String, String, [u64; 4])>) {
+        let p = &node["position"];
+        out.push((
+            node["node_type"].as_str().unwrap().to_string(),
+            node["label"].as_str().unwrap().to_string(),
+            [
+                p["start_line"].as_u64().unwrap(),
+                p["start_col"].as_u64().unwrap(),
+                p["end_line"].as_u64().unwrap(),
+                p["end_col"].as_u64().unwrap(),
+            ],
+        ));
+        for child in node["children"].as_array().unwrap() {
+            flatten(child, out);
+        }
+    }
+
+    fn nodes(source: &str) -> Vec<(String, String, [u64; 4])> {
+        let mut out = Vec::new();
+        flatten(&tree(source), &mut out);
+        out
+    }
+
+    /// Source text covered by a single-line span.
+    fn span_text<'a>(source: &'a str, span: [u64; 4]) -> &'a str {
+        assert_eq!(span[0], span[2], "single-line span expected");
+        let line = source.lines().nth(span[0] as usize).unwrap();
+        &line[span[1] as usize..span[3] as usize]
+    }
+
+    /// The statements that differ between two sources, with their spans.
+    fn changed_statements(old: &str, new: &str) -> Vec<((String, [u64; 4]), (String, [u64; 4]))> {
+        let pick = |source: &str| -> Vec<(String, [u64; 4])> {
+            nodes(source)
+                .into_iter()
+                .filter(|(t, _, _)| t == "sas_statement")
+                .map(|(_, l, s)| (l, s))
+                .collect()
+        };
+        let (a, b) = (pick(old), pick(new));
+        assert_eq!(a.len(), b.len(), "{a:?} vs {b:?}");
+        a.into_iter().zip(b).filter(|(x, y)| x.0 != y.0).collect()
+    }
+
+    #[test]
+    fn exact_issue_9_pairs_change_one_statement_with_source_spans() {
+        for (old, new, old_label, new_label, old_text, new_text) in [
+            (
+                "%macro greet(x=one);\n  %put &x;\n%mend;\n%greet();\n",
+                "%macro greet(x=two);\n  %put &x;\n%mend;\n%greet();\n",
+                "%macro greet(x=one)",
+                "%macro greet(x=two)",
+                "%macro greet(x=one);",
+                "%macro greet(x=two);",
+            ),
+            (
+                "%macro f(x=1);\n%put &x;\n%mend;\n",
+                "%macro f(x=2);\n%put &x;\n%mend;\n",
+                "%macro f(x=1)",
+                "%macro f(x=2)",
+                "%macro f(x=1);",
+                "%macro f(x=2);",
+            ),
+            (
+                "proc sort data=work.input out=work.output;\n  by id;\nrun;\n",
+                "proc sort data=work.input out=work.output nodupkey;\n  by id;\nrun;\n",
+                "proc sort data=work.input out=work.output",
+                "proc sort data=work.input out=work.output nodupkey",
+                "proc sort data=work.input out=work.output;",
+                "proc sort data=work.input out=work.output nodupkey;",
+            ),
+            (
+                "proc sort data=work.a;\n by x;\nrun;\n",
+                "proc sort data=work.a nodupkey;\n by x;\nrun;\n",
+                "proc sort data=work.a",
+                "proc sort data=work.a nodupkey",
+                "proc sort data=work.a;",
+                "proc sort data=work.a nodupkey;",
+            ),
+            (
+                "data a; x=1; run;\n",
+                "data a; x=2; run;\n",
+                "x=1",
+                "x=2",
+                "x=1;",
+                "x=2;",
+            ),
+        ] {
+            let changed = changed_statements(old, new);
+            assert_eq!(changed.len(), 1, "{old:?} -> {new:?}: {changed:?}");
+            let ((ol, os), (nl, ns)) = &changed[0];
+            assert_eq!((ol.as_str(), nl.as_str()), (old_label, new_label));
+            assert_eq!(span_text(old, *os), old_text);
+            assert_eq!(span_text(new, *ns), new_text);
+        }
+    }
+
+    #[test]
+    fn inline_step_statements_are_split_on_semicolons_with_byte_columns() {
+        let source = "data a; x=1; run;\n";
+        let all = nodes(source);
+        assert_eq!(
+            all,
+            vec![
+                ("sas_program".into(), "sas_program".into(), [0, 0, 0, 0]),
+                ("data_step".into(), "A".into(), [0, 0, 0, 17]),
+                ("sas_statement".into(), "data a".into(), [0, 0, 0, 7]),
+                ("sas_statement".into(), "x=1".into(), [0, 8, 0, 12]),
+            ]
+        );
+        // The same constructs on multiple lines and with UTF-8 before them.
+        let multi = "data a;\n  é = 'x;y'; x\n   = 1;\nrun;\n";
+        let all = nodes(multi);
+        assert_eq!(all[3].1, "é = 'x;y'");
+        assert_eq!(span_text(multi, all[3].2), "é = 'x;y';");
+        assert_eq!(all[4].1, "x = 1");
+        assert_eq!(all[4].2, [1, 14, 2, 7]);
+    }
+
+    #[test]
+    fn multiline_headers_keep_every_option_and_parameter() {
+        let old = "%macro greet(\n  x=one,\n  y=2\n);\n%mend greet;\nproc sort\n  data=a\n  out=b;\n  by id;\nrun;\n";
+        let new = old
+            .replace("y=2", "y=3")
+            .replace("out=b;", "out=b nodupkey;");
+        let a = nodes(old);
+        let b = nodes(&new);
+        assert_eq!(a[1], ("macro".into(), "GREET".into(), [0, 0, 4, 12]));
+        assert_eq!(a[2].1, "%macro greet( x=one, y=2 )");
+        assert_eq!(b[2].1, "%macro greet( x=one, y=3 )");
+        assert_eq!(
+            a[3],
+            ("proc_step".into(), "SORT (DATA=A)".into(), [5, 0, 9, 4])
+        );
+        assert_eq!(a[4].1, "proc sort data=a out=b");
+        assert_eq!(b[4].1, "proc sort data=a out=b nodupkey");
+    }
+
+    #[test]
+    fn quoted_and_macro_quoted_delimiters_do_not_split_statements() {
+        let source = "%let a = %str(x;y);\n%let b = \"p;/*q*/\";\ndata d; s = 'it''s;'; run;\n";
+        let labels: Vec<String> = nodes(source).into_iter().map(|n| n.1).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "sas_program",
+                "%let a = %str(x;y)",
+                "%let b = \"p;/*q*/\"",
+                "D",
+                "data d",
+                "s = 'it''s;'",
+            ]
+        );
+    }
+
+    #[test]
+    fn whitespace_and_comment_only_edits_are_not_content_changes() {
+        for (old, new) in [
+            ("data a; x=1; run;\n", "data a;\n  x=1;\nrun;\n"),
+            ("data a; x=1; run;\n", "data   a;   x=1;   run;"),
+            (
+                "%macro greet(x=one);\n  %put &x;\n%mend;\n",
+                "%macro greet(x=one); /* note */\n%put &x; %* why;\n%mend;\n",
+            ),
+            (
+                "proc sort data=work.a out=work.b;\n  by id;\nrun;\n",
+                "proc sort\n  data=work.a /* in */\n  out=work.b;\n* sort key;\n  by id;\nrun;\n",
+            ),
+        ] {
+            let strip = |s: &str| -> Vec<(String, String)> {
+                nodes(s).into_iter().map(|(t, l, _)| (t, l)).collect()
+            };
+            assert_eq!(strip(old), strip(new), "{old:?} vs {new:?}");
+        }
+    }
+
+    #[test]
+    fn steps_nest_in_macros_and_data_or_proc_implicitly_end_a_step() {
+        let source = "%macro m;\n  proc print data=a;\n  run;\n  data b; x=1;\n%mend m;\nproc means data=b;\nproc print;\nrun cancel;\n%put done;\n";
+        let tree = tree(source);
+        let top = tree["children"].as_array().unwrap();
+        let types: Vec<&str> = top
+            .iter()
+            .map(|n| n["node_type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, ["macro", "proc_step", "proc_step", "sas_statement"]);
+        let inner: Vec<&str> = top[0]["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["node_type"].as_str().unwrap())
+            .collect();
+        assert_eq!(inner, ["sas_statement", "proc_step", "data_step"]);
+        assert_eq!(top[0]["position"]["end_line"], 4);
+        // A RUN with options alters behaviour, so it is retained.
+        assert_eq!(top[2]["children"][1]["label"], "run cancel");
+        assert_eq!(top[3]["label"], "%put done");
+        let mut ids = std::collections::HashSet::new();
+        let mut all = vec![&tree];
+        while let Some(n) = all.pop() {
+            assert!(
+                ids.insert(n["id"].as_str().unwrap().to_string()),
+                "duplicate id"
+            );
+            all.extend(n["children"].as_array().unwrap());
+        }
+        assert_eq!(parse_sas(source), parse_sas(source));
+    }
+
+    #[test]
+    fn unterminated_trailing_text_is_preserved_not_dropped() {
+        let a = nodes("data a; x=1; run;\n%greet()\n");
+        let b = nodes("data a; x=1; run;\n%greet(y)\n");
+        assert_eq!(a.last().unwrap().1, "%greet()");
+        assert_eq!(b.last().unwrap().1, "%greet(y)");
+        assert_eq!(a.last().unwrap().2, [1, 0, 1, 8]);
+    }
 }
