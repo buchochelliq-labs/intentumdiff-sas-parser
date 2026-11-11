@@ -8,6 +8,8 @@
 //!   macro       — %MACRO … %MEND block (label = macro name)
 //!   data_step   — DATA … RUN/QUIT block (label = dataset name)
 //!   proc_step   — PROC … RUN/QUIT block (label = "PROCNAME" or "PROCNAME (DATA=ds)")
+//!   sas_statement   — one `;`-terminated statement (label = normalised text)
+//!   sas_data_record — one DATALINES/CARDS input line (label = the line)
 
 use intentumdiff_plugin_sdk::tree::{SemanticNode, SemanticNodeBuilder};
 
@@ -60,15 +62,84 @@ pub(crate) fn detect_language_impl(filename: &str, _content: &str) -> String {
 // Parser
 // ---------------------------------------------------------------------------
 
+/// Byte length of the whitespace character at `i`, or 0. Every scanner in
+/// this file uses this one definition (Unicode `White_Space`, the same set as
+/// `char::is_whitespace`, `str::trim_end` and `str::split_whitespace`), so no
+/// two loops can disagree about what is layout. `i` need not be a char
+/// boundary: a UTF-8 continuation byte is never whitespace.
+fn whitespace_len_at(source: &str, i: usize) -> usize {
+    if !source.is_char_boundary(i) {
+        return 0;
+    }
+    source[i..]
+        .chars()
+        .next()
+        .filter(|c| c.is_whitespace())
+        .map_or(0, char::len_utf8)
+}
+
+/// Byte range of an inline data section (the records after `DATALINES;`,
+/// `CARDS;`, `LINES;` or their `…4;` forms), up to but excluding the line
+/// that ends it. Its contents are data, not SAS statements: no comments,
+/// quotes or statement splitting apply inside.
+type DataSection = std::ops::Range<usize>;
+
+/// The start of the line after the one containing byte `i`.
+fn next_line_start(bytes: &[u8], i: usize) -> usize {
+    bytes[i..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(bytes.len(), |p| i + p + 1)
+}
+
+/// If `statement` (comment-free, without its `;`) opens inline data, the
+/// section that follows the `;` at byte `semi`: from the next line to the
+/// line holding a `;` (or, for the `…4` forms, the line starting `;;;;`).
+fn data_section_after(bytes: &[u8], statement: &str, semi: usize) -> Option<DataSection> {
+    let keyword = statement.trim();
+    let four = ["DATALINES4", "CARDS4", "LINES4"]
+        .iter()
+        .any(|k| keyword.eq_ignore_ascii_case(k));
+    let plain = ["DATALINES", "CARDS", "LINES"]
+        .iter()
+        .any(|k| keyword.eq_ignore_ascii_case(k));
+    if !four && !plain {
+        return None;
+    }
+    let start = next_line_start(bytes, semi);
+    let mut line = start;
+    while line < bytes.len() {
+        let next = next_line_start(bytes, line);
+        let text = &bytes[line..next];
+        if (four && text.starts_with(b";;;;")) || (!four && text.contains(&b';')) {
+            break;
+        }
+        line = next;
+    }
+    Some(start..line)
+}
+
 // Replace comments with spaces, preserving UTF-8 byte offsets and line breaks.
 // Quote tracking prevents comment-looking macro values from being discarded.
-fn without_comments(source: &str) -> Result<String, &'static str> {
+// Also returns the inline data sections, which are copied verbatim.
+fn without_comments(source: &str) -> Result<(String, Vec<DataSection>), &'static str> {
     let bytes = source.as_bytes();
     let mut output = bytes.to_vec();
+    let mut sections = Vec::new();
+    let mut pending: Option<DataSection> = None;
     let mut i = 0;
     let mut quote = None;
     let mut statement_start = true;
+    let mut statement_begin = 0;
     while i < bytes.len() {
+        if let Some(section) = pending.take_if(|s| i >= s.start) {
+            i = i.max(section.end);
+            quote = None;
+            statement_start = true;
+            statement_begin = i;
+            sections.push(section);
+            continue;
+        }
         if let Some(q) = quote {
             if bytes[i] == q {
                 if bytes.get(i + 1) == Some(&q) {
@@ -104,28 +175,48 @@ fn without_comments(source: &str) -> Result<String, &'static str> {
                     *byte = b' ';
                 }
             }
+            if !block {
+                statement_start = true;
+                statement_begin = i;
+            }
+            continue;
+        }
+        if bytes[i] == b';' {
+            // Comment bytes are blanked to ASCII, so `output` stays UTF-8.
+            let statement = std::str::from_utf8(&output[statement_begin..i]).unwrap_or("");
+            pending = data_section_after(bytes, statement, i);
+            statement_start = true;
+            statement_begin = i + 1;
+            i += 1;
+            continue;
+        }
+        let ws = whitespace_len_at(source, i);
+        if ws > 0 {
+            i += ws;
             continue;
         }
         if matches!(bytes[i], b'\'' | b'"') {
             quote = Some(bytes[i]);
         }
-        if bytes[i] == b';' {
-            statement_start = true;
-        } else if !bytes[i].is_ascii_whitespace() {
-            statement_start = false;
-        }
+        statement_start = false;
         i += 1;
     }
-    String::from_utf8(output).map_err(|_| "Invalid SAS comment boundary")
+    sections.extend(pending);
+    let text = String::from_utf8(output).map_err(|_| "Invalid SAS comment boundary")?;
+    Ok((text, sections))
 }
 
-/// One semicolon-terminated SAS statement, located in the original source.
+/// One semicolon-terminated SAS statement, or one inline data record,
+/// located in the original source.
 struct Statement {
     /// Statement text without its terminating `;`, whitespace runs outside
-    /// quoted strings collapsed to one space (layout is not semantics).
+    /// quoted strings and macro-quoted arguments collapsed to one space
+    /// (layout is not semantics). For a data record: the line verbatim,
+    /// minus trailing blanks.
     text: String,
     start: (u32, u32),
     end: (u32, u32),
+    record: bool,
 }
 
 /// Byte offset -> (0-based row, UTF-8 byte column).
@@ -156,20 +247,68 @@ fn starts_with_ignore_case(bytes: &[u8], prefix: &[u8]) -> bool {
     bytes.len() >= prefix.len() && bytes[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
-/// Collapse whitespace outside quoted strings; quoted content is kept verbatim.
-fn normalize_statement(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut quote: Option<char> = None;
-    let mut pending_space = false;
-    for ch in text.chars() {
-        if let Some(q) = quote {
-            out.push(ch);
-            if ch == q {
-                quote = None;
-            }
+/// Per byte: is it inside a quoted string or a `%str(...)` / `%nrstr(...)`
+/// argument (delimiters included)? Such bytes are content: a `;` there does
+/// not end a statement and whitespace there is significant. One mask serves
+/// both statement splitting and label normalisation so they always agree.
+/// Inside macro quoting, `%` escapes the next quote, parenthesis or `%`.
+fn protected_bytes(bytes: &[u8], sections: &[DataSection]) -> Vec<bool> {
+    let mut mask = vec![false; bytes.len()];
+    let mut sections = sections.iter().peekable();
+    let mut quote: Option<u8> = None;
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(section) = sections.next_if(|s| i >= s.start) {
+            i = i.max(section.end);
+            quote = None;
+            depth = 0;
             continue;
         }
-        if ch.is_whitespace() {
+        let b = bytes[i];
+        if let Some(q) = quote {
+            mask[i] = true;
+            if b == q {
+                quote = None;
+            }
+        } else if depth > 0 {
+            mask[i] = true;
+            match b {
+                b'%' if matches!(bytes.get(i + 1), Some(b'\'' | b'"' | b'(' | b')' | b'%')) => {
+                    mask[i + 1] = true;
+                    i += 2;
+                    continue;
+                }
+                b'\'' | b'"' => quote = Some(b),
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+        } else if b == b'%'
+            && (starts_with_ignore_case(&bytes[i..], b"%str(")
+                || starts_with_ignore_case(&bytes[i..], b"%nrstr("))
+        {
+            let open = i + bytes[i..].iter().position(|&c| c == b'(').unwrap_or(0);
+            mask[i..=open].fill(true);
+            depth = 1;
+            i = open + 1;
+            continue;
+        } else if matches!(b, b'\'' | b'"') {
+            mask[i] = true;
+            quote = Some(b);
+        }
+        i += 1;
+    }
+    mask
+}
+
+/// Collapse unprotected whitespace; protected text is kept verbatim.
+/// `mask` holds the protection flags for exactly the bytes of `text`.
+fn normalize_statement(text: &str, mask: &[bool]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for (offset, ch) in text.char_indices() {
+        if !mask[offset] && ch.is_whitespace() {
             pending_space = !out.is_empty();
             continue;
         }
@@ -177,79 +316,77 @@ fn normalize_statement(text: &str) -> String {
             out.push(' ');
             pending_space = false;
         }
-        if ch == '\'' || ch == '"' {
-            quote = Some(ch);
-        }
         out.push(ch);
     }
     out
+}
+
+/// One node per non-blank record of an inline data section. Records keep
+/// their leading and interior whitespace (column input reads it) and their
+/// line boundaries (each record is an input line).
+fn data_records(source: &str, section: &DataSection, index: &LineIndex, out: &mut Vec<Statement>) {
+    let mut line = section.start;
+    while line < section.end {
+        let next = next_line_start(source.as_bytes(), line).min(section.end);
+        let text = source[line..next].trim_end();
+        if !text.trim_start().is_empty() {
+            out.push(Statement {
+                text: text.to_string(),
+                start: index.at(line),
+                end: index.at(line + text.len()),
+                record: true,
+            });
+        }
+        line = next;
+    }
 }
 
 /// Split comment-free SAS source into statements. A `;` ends a statement
 /// unless it is inside a quoted string or a `%str(...)` / `%nrstr(...)`
 /// macro quoting function. Several statements may share one line and one
 /// statement may span several lines; text after the last `;` is kept as a
-/// final unterminated statement so no source is silently dropped.
-fn split_statements(source: &str) -> Vec<Statement> {
+/// final unterminated statement so no source is silently dropped. Inline
+/// data sections become one record per line.
+fn split_statements(source: &str, sections: &[DataSection]) -> Vec<Statement> {
     let bytes = source.as_bytes();
     let index = LineIndex::new(source);
+    let mask = protected_bytes(bytes, sections);
+    let mut sections = sections.iter().peekable();
     let mut statements = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
+        let ws = whitespace_len_at(source, i);
+        if ws > 0 {
+            i += ws;
+            continue;
         }
-        if i >= bytes.len() {
-            break;
+        if let Some(section) = sections.next_if(|s| i >= s.start) {
+            data_records(source, section, &index, &mut statements);
+            i = i.max(section.end);
+            continue;
         }
+        // A statement cannot run into the next data section.
+        let limit = sections.peek().map_or(bytes.len(), |s| s.start);
         let start = i;
-        let mut quote: Option<u8> = None;
-        let mut macro_paren_depth = 0usize;
-        let mut terminator = None;
-        while i < bytes.len() {
-            let b = bytes[i];
-            if let Some(q) = quote {
-                if b == q {
-                    quote = None;
-                }
-                i += 1;
-                continue;
-            }
-            match b {
-                b'\'' | b'"' => quote = Some(b),
-                b'%' if macro_paren_depth == 0
-                    && (starts_with_ignore_case(&bytes[i..], b"%str(")
-                        || starts_with_ignore_case(&bytes[i..], b"%nrstr(")) =>
-                {
-                    let open = i + bytes[i..].iter().position(|&c| c == b'(').unwrap_or(0);
-                    macro_paren_depth = 1;
-                    i = open + 1;
-                    continue;
-                }
-                b'(' if macro_paren_depth > 0 => macro_paren_depth += 1,
-                b')' if macro_paren_depth > 0 => macro_paren_depth -= 1,
-                b';' if macro_paren_depth == 0 => {
-                    terminator = Some(i);
-                    break;
-                }
-                _ => {}
-            }
-            i += 1;
-        }
+        let terminator = (start..limit).find(|&j| bytes[j] == b';' && !mask[j]);
         let (body_end, end) = match terminator {
             Some(semi) => (semi, semi + 1),
             None => {
-                let trimmed = source[start..].trim_end().len();
-                (start + trimmed, start + trimmed)
+                // Non-empty: `start` holds a non-whitespace character.
+                let trimmed = start + source[start..limit].trim_end().len();
+                (trimmed, trimmed)
             }
         };
-        i = end;
-        let text = normalize_statement(&source[start..body_end]);
+        let text = normalize_statement(&source[start..body_end], &mask[start..body_end]);
         statements.push(Statement {
             text,
             start: index.at(start),
             end: index.at(end),
+            record: false,
         });
+        // `end > start` always holds; the guard makes the loop provably
+        // advance even if that reasoning is ever broken by a later edit.
+        i = end.max(start + source[start..].chars().next().map_or(1, char::len_utf8));
     }
     statements
 }
@@ -275,10 +412,15 @@ impl Frame {
 
     fn push_statement(&mut self, stmt: &Statement) {
         let id = self.next_id();
+        let node_type = if stmt.record {
+            "sas_data_record"
+        } else {
+            "sas_statement"
+        };
         self.children.push(
             SemanticNodeBuilder::new(
                 &id,
-                "sas_statement",
+                node_type,
                 &stmt.text,
                 stmt.start.0,
                 stmt.start.1,
@@ -335,8 +477,8 @@ fn open_block(stack: &mut Vec<Frame>, node_type: &'static str, label: String, he
 }
 
 pub(crate) fn parse_sas(source: &str) -> String {
-    let uncommented = match without_comments(source) {
-        Ok(text) => text,
+    let (uncommented, sections) = match without_comments(source) {
+        Ok(result) => result,
         Err(error) => return serde_json::json!({"error": error}).to_string(),
     };
     let total_lines = source.lines().count().saturating_sub(1) as u32;
@@ -349,7 +491,11 @@ pub(crate) fn parse_sas(source: &str) -> String {
         children: Vec::new(),
     }];
 
-    for stmt in split_statements(&uncommented) {
+    for stmt in split_statements(&uncommented, &sections) {
+        if stmt.record {
+            stack.last_mut().expect("root frame").push_statement(&stmt);
+            continue;
+        }
         let upper = stmt.text.to_uppercase();
         let words: Vec<&str> = upper.split_whitespace().collect();
         let Some(&first) = words.first() else {
@@ -731,14 +877,17 @@ mod tests {
     }
 
     /// Source text covered by a single-line span.
-    fn span_text<'a>(source: &'a str, span: [u64; 4]) -> &'a str {
+    fn span_text(source: &str, span: [u64; 4]) -> &str {
         assert_eq!(span[0], span[2], "single-line span expected");
         let line = source.lines().nth(span[0] as usize).unwrap();
         &line[span[1] as usize..span[3] as usize]
     }
 
+    /// A statement label and its span.
+    type Labelled = (String, [u64; 4]);
+
     /// The statements that differ between two sources, with their spans.
-    fn changed_statements(old: &str, new: &str) -> Vec<((String, [u64; 4]), (String, [u64; 4]))> {
+    fn changed_statements(old: &str, new: &str) -> Vec<(Labelled, Labelled)> {
         let pick = |source: &str| -> Vec<(String, [u64; 4])> {
             nodes(source)
                 .into_iter()
@@ -914,6 +1063,164 @@ mod tests {
             all.extend(n["children"].as_array().unwrap());
         }
         assert_eq!(parse_sas(source), parse_sas(source));
+    }
+
+    // -- PR #10 review: Unicode whitespace must never stall the scanner -------
+
+    #[test]
+    fn unicode_whitespace_at_eof_or_mid_input_terminates_and_is_layout() {
+        for ws in ['\u{00a0}', '\u{2003}', '\u{3000}'] {
+            let base = "data a; x=1; run;";
+            // Whitespace-only input is an empty program.
+            assert_eq!(nodes(&format!("{ws}\n{ws}")).len(), 1);
+            // Trailing (the reported hang), after a newline, and mixed.
+            for source in [
+                format!("{base}{ws}"),
+                format!("{base}\n{ws}{ws}"),
+                format!("{base} {ws}\n"),
+            ] {
+                // Everything below the root (whose span is the whole file).
+                assert_eq!(nodes(&source)[1..], nodes(base)[1..], "{source:?}");
+            }
+            // Mid-input: between statements, before an unterminated tail,
+            // and before a `*` statement comment.
+            let mid = format!("data a;{ws}x=1;{ws}\n{ws}run;{ws}%put x{ws}");
+            let labels: Vec<String> = nodes(&mid).into_iter().map(|n| n.1).collect();
+            assert_eq!(labels, ["sas_program", "A", "data a", "x=1", "%put x"]);
+            assert_eq!(
+                nodes(&format!("%let a=1;{ws}* note;\n%let b=2;"))[1..],
+                nodes("%let a=1;\n%let b=2;")[1..]
+            );
+        }
+    }
+
+    // -- PR #10 review: macro-quoted whitespace is a value -------------------
+
+    #[test]
+    fn whitespace_inside_macro_quoting_is_preserved() {
+        let label = |s: &str| nodes(s)[1].1.clone();
+        // The exact review pair, and the %NRSTR form.
+        assert_eq!(label("%let x=%str(a  b);"), "%let x=%str(a  b)");
+        assert_ne!(label("%let x=%str(a  b);"), label("%let x=%str(a b);"));
+        assert_ne!(
+            label("%let x=%NrStr(a\n  b);"),
+            label("%let x=%nrstr(a b);")
+        );
+        // Layout outside the quoting function still collapses.
+        assert_eq!(label("%let   x =\n %str( a  b );"), "%let x = %str( a  b )");
+        // `%'` and `%)` are escapes inside %STR: they neither open a quote
+        // nor close the argument, so the `;` inside stays content.
+        let all = nodes("%let x=%str(it%'s;  a%) b);\n%let y=1;\n");
+        let labels: Vec<&str> = all.iter().map(|n| n.1.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["sas_program", "%let x=%str(it%'s;  a%) b)", "%let y=1"]
+        );
+    }
+
+    // -- PR #10 review: inline data keeps record boundaries -------------------
+
+    #[test]
+    fn datalines_records_keep_their_line_boundaries() {
+        // The exact review pair: two records vs one record.
+        let old = "data a; input x y; datalines;\n1 2\n3 4\n;\nrun;";
+        let new = "data a; input x y; datalines;\n1 2 3 4\n;\nrun;";
+        let a = nodes(old);
+        let b = nodes(new);
+        assert_ne!(
+            a.iter().map(|n| (&n.0, &n.1)).collect::<Vec<_>>(),
+            b.iter().map(|n| (&n.0, &n.1)).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            a[1..],
+            [
+                ("data_step".into(), "A".into(), [0, 0, 4, 4]),
+                ("sas_statement".into(), "data a".into(), [0, 0, 0, 7]),
+                ("sas_statement".into(), "input x y".into(), [0, 8, 0, 18]),
+                ("sas_statement".into(), "datalines".into(), [0, 19, 0, 29]),
+                ("sas_data_record".into(), "1 2".into(), [1, 0, 1, 3]),
+                ("sas_data_record".into(), "3 4".into(), [2, 0, 2, 3]),
+            ]
+        );
+        // A one-value edit changes exactly that record; column-significant
+        // interior and leading blanks are content too.
+        let pick = |s: &str| -> Vec<String> {
+            nodes(s)
+                .into_iter()
+                .filter(|n| n.0 == "sas_data_record")
+                .map(|n| n.1)
+                .collect()
+        };
+        assert_eq!(pick(old.replace("3 4", "3 5").as_str()), ["1 2", "3 5"]);
+        assert_eq!(pick(old.replace("1 2", "1  2").as_str())[0], "1  2");
+        assert_eq!(pick(old.replace("1 2", " 1 2").as_str())[0], " 1 2");
+    }
+
+    #[test]
+    fn data_section_contents_are_not_parsed_as_sas() {
+        // Quotes, comment markers and `;;;;`-terminated `;` are all data.
+        let source = "data names;\n  input name $ note $;\n  cards4;\nO'Brien /*x*/\n* star; semi\n;;;;\nrun;\nproc print data=names;\nrun;\n";
+        let all = nodes(source);
+        let records: Vec<&str> = all
+            .iter()
+            .filter(|n| n.0 == "sas_data_record")
+            .map(|n| n.1.as_str())
+            .collect();
+        assert_eq!(records, ["O'Brien /*x*/", "* star; semi"]);
+        let top = tree(source);
+        let types: Vec<&str> = top["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["node_type"].as_str().unwrap())
+            .collect();
+        assert_eq!(types, ["data_step", "proc_step"]);
+        // CARDS and LINES forms, and a section that runs to end of file.
+        for keyword in ["CARDS", "lines", "Datalines"] {
+            let source = format!("data a; input x;\n{keyword};\n 7\n");
+            assert_eq!(nodes(&source).last().unwrap().1, " 7");
+        }
+        // Layout and comment edits outside the data stay layout.
+        let strip = |s: &str| -> Vec<(String, String)> {
+            nodes(s).into_iter().map(|(t, l, _)| (t, l)).collect()
+        };
+        assert_eq!(
+            strip("data a; input x; datalines;\n1\n;\nrun;"),
+            strip("data a;\n  input x; /* c */ datalines;\n1\n;\nrun;")
+        );
+    }
+
+    #[test]
+    fn every_short_token_sequence_terminates_without_panicking() {
+        const TOKENS: [&str; 16] = [
+            ";",
+            "'",
+            "\"",
+            "%str(",
+            "%nrstr(",
+            "%'",
+            ")",
+            "*",
+            "/*",
+            "*/",
+            "\n",
+            " ",
+            "\u{00a0}",
+            "\u{3000}",
+            "é",
+            "datalines;\n",
+        ];
+        let n = TOKENS.len();
+        for code in 0..n.pow(4) {
+            let mut source = String::new();
+            let mut c = code;
+            for _ in 0..4 {
+                source.push_str(TOKENS[c % n]);
+                c /= n;
+            }
+            let out = parse_sas(&source);
+            intentumdiff_plugin_sdk::testing::assert_valid_json(&out, &source);
+        }
     }
 
     #[test]
